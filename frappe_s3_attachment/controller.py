@@ -332,12 +332,11 @@ def ping():
     return "pong"
 
 
-ATTACHMENT_TRACKED_DOCTYPES = ("Journal Entry", "Purchase Invoice", "Payment Entry")
-
-
 def update_has_attachment_flag(doc, method):
     """Update custom_has_attachment on parent document when files are added or removed."""
-    if doc.attached_to_doctype not in ATTACHMENT_TRACKED_DOCTYPES or not doc.attached_to_name:
+    if not doc.attached_to_doctype or not doc.attached_to_name:
+        return
+    if not frappe.get_meta(doc.attached_to_doctype).has_field("custom_has_attachment"):
         return
     if not frappe.db.exists(doc.attached_to_doctype, doc.attached_to_name):
         return
