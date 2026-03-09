@@ -77,6 +77,14 @@ doctype_list_js = {
 # 	"Event": "frappe.desk.doctype.event.event.has_permission",
 # }
 
+# DocType Class
+# ---------------
+# Override standard doctype classes
+
+override_doctype_class = {
+    "File": "frappe_s3_attachment.overrides.file.CustomFile",
+}
+
 # Document Events
 # ---------------
 # Hook on document methods and events
