@@ -77,6 +77,14 @@ doctype_list_js = {
 # 	"Event": "frappe.desk.doctype.event.event.has_permission",
 # }
 
+# DocType Class
+# ---------------
+# Override standard doctype classes
+
+override_doctype_class = {
+    "File": "frappe_s3_attachment.overrides.file.CustomFile",
+}
+
 # Document Events
 # ---------------
 # Hook on document methods and events
@@ -91,8 +99,14 @@ doctype_list_js = {
 
 doc_events = {
     "File": {
-        "after_insert": "frappe_s3_attachment.controller.file_upload_to_s3",
-        "on_trash": "frappe_s3_attachment.controller.delete_from_cloud"
+        "after_insert": [
+            "frappe_s3_attachment.controller.file_upload_to_s3",
+            "frappe_s3_attachment.controller.update_has_attachment_flag",
+        ],
+        "on_trash": [
+            "frappe_s3_attachment.controller.delete_from_cloud",
+            "frappe_s3_attachment.controller.update_has_attachment_flag",
+        ],
     }
 }
 

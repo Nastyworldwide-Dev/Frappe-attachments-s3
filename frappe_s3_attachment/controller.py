@@ -223,7 +223,7 @@ def file_upload_to_s3(doc, method):
         doc.file_url = file_url
 
         if parent_doctype and frappe.get_meta(parent_doctype).get('image_field'):
-            frappe.db.set_value(parent_doctype, parent_name, frappe.get_meta(parent_doctype).get('image_field'), file_url)
+            frappe.db.set_value(parent_doctype, parent_name, frappe.get_meta(parent_doctype).get('image_field'), file_url, update_modified=False)
 
         frappe.db.commit()
 
@@ -330,3 +330,30 @@ def ping():
     Test function to check if api function work.
     """
     return "pong"
+
+
+def update_has_attachment_flag(doc, method):
+    """Update custom_has_attachment on parent document when files are added or removed."""
+    if not doc.attached_to_doctype or not doc.attached_to_name:
+        return
+    if not frappe.get_meta(doc.attached_to_doctype).has_field("custom_has_attachment"):
+        return
+    if not frappe.db.exists(doc.attached_to_doctype, doc.attached_to_name):
+        return
+
+    if method == "after_insert":
+        frappe.db.set_value(
+            doc.attached_to_doctype, doc.attached_to_name,
+            "custom_has_attachment", 1, update_modified=False
+        )
+    elif method == "on_trash":
+        remaining = frappe.db.count("File", {
+            "attached_to_doctype": doc.attached_to_doctype,
+            "attached_to_name": doc.attached_to_name,
+        })
+        # on_trash fires before deletion, so the current file is still counted
+        if remaining <= 1:
+            frappe.db.set_value(
+                doc.attached_to_doctype, doc.attached_to_name,
+                "custom_has_attachment", 0, update_modified=False
+            )

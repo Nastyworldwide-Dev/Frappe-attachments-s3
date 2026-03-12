@@ -1,0 +1,16 @@
+[project]
+name = "frappe_s3_attachment"
+version = "0.0.1"
+description = "Frappe app to make file upload to S3 through attach file option."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Frappe", email = "ramesh.ravi@zerodha.com" }]
+requires-python = ">=3.10"
+dependencies = ["python-magic==0.4.18"]
+
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+[tool.flit.module]
+name = "frappe_s3_attachment"
