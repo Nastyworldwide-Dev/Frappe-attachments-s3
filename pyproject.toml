@@ -1,6 +1,6 @@
 [project]
 name = "frappe_s3_attachment"
-version = "0.0.1"
+version = "0.1.5"
 description = "Frappe app to make file upload to S3 through attach file option."
 readme = "README.md"
 license = { text = "MIT" }
