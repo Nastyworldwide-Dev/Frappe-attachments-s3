@@ -129,14 +129,17 @@ class S3Operations(object):
         key = self.key_generator(file_name, parent_doctype, parent_name)
         content_type = mime_type
         try:
+            extra_args = {
+                "ContentType": content_type,
+                "Metadata": {"ContentType": content_type, "file_name": file_name},
+            }
+            if not is_private and frappe.local.conf.get("s3_use_acl"):
+                extra_args["ACL"] = "public-read"
             self.S3_CLIENT.upload_file(
                 file_path,
                 self.BUCKET,
                 key,
-                ExtraArgs={
-                    "ContentType": content_type,
-                    "Metadata": {"ContentType": content_type, "file_name": file_name},
-                },
+                ExtraArgs=extra_args,
             )
 
         except boto3.exceptions.S3UploadFailedError:
