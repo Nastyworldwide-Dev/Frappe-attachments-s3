@@ -194,8 +194,13 @@ def file_upload_to_s3(doc, method):
     """
     check and upload files to s3. the path check and
     """
-    s3_upload = S3Operations()
     path = doc.file_url
+    # Skip files already on S3 (e.g. attachments copied from an amended-from
+    # document). Their file_url is an S3 URL, not a local path, so trying to
+    # re-upload would fail with FileNotFoundError.
+    if path and s3_file_regex_match(path):
+        return
+    s3_upload = S3Operations()
     site_path = frappe.utils.get_site_path()
     parent_doctype = doc.attached_to_doctype or "File"
     parent_name = doc.attached_to_name

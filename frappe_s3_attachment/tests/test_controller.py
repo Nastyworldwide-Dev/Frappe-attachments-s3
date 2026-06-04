@@ -4,6 +4,57 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 
+class TestFileUploadToS3SkipsExisting(unittest.TestCase):
+    """Verify file_upload_to_s3 does not re-upload files already on S3.
+
+    Amending a document copies its attachments into new File records whose
+    file_url already points to S3 (generate_file URL). Re-uploading those
+    treats the URL as a local path and crashes with FileNotFoundError.
+    """
+
+    def _run_hook(self, file_url):
+        mock_frappe = MagicMock()
+        mock_frappe.local.conf.get.return_value = None
+
+        captured = {"s3_constructed": False}
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch("frappe_s3_attachment.controller.S3Operations") as mock_ops,
+        ):
+
+            def _mark(*a, **k):
+                captured["s3_constructed"] = True
+                return MagicMock()
+
+            mock_ops.side_effect = _mark
+
+            from frappe_s3_attachment.controller import file_upload_to_s3
+
+            doc = MagicMock()
+            doc.file_url = file_url
+            doc.is_private = 1
+            doc.attached_to_doctype = "Journal Entry"
+            doc.attached_to_name = "JE-001"
+
+            file_upload_to_s3(doc, "after_insert")
+
+        return captured["s3_constructed"]
+
+    def test_skips_already_uploaded_private_file(self):
+        """A copied attachment already on S3 must not be re-uploaded."""
+        url = (
+            "/api/method/frappe_s3_attachment.controller.generate_file"
+            "?key=2026/02/12/Journal Entry/ABC_Report.pdf&file_name=Report.pdf"
+        )
+        self.assertFalse(self._run_hook(url))
+
+    def test_skips_already_uploaded_public_file(self):
+        """A public file already on S3 (https URL) must not be re-uploaded."""
+        url = "https://test-bucket.s3.amazonaws.com/2026/02/12/x_Report.pdf"
+        self.assertFalse(self._run_hook(url))
+
+
 class TestS3UploadACL(unittest.TestCase):
     """Verify ACL parameter behavior in upload_files_to_s3_with_key."""
 
