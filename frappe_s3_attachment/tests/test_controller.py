@@ -73,5 +73,47 @@ class TestS3UploadACL(unittest.TestCase):
         self.assertNotIn("ACL", extra_args)
 
 
+class TestFileUploadToS3SkipsExistingS3Files(unittest.TestCase):
+    """Files already stored on S3 (e.g. copied from an amended document) must
+    not be re-uploaded — no local copy exists, so it would raise FileNotFoundError."""
+
+    def _run_hook(self, file_url):
+        mock_frappe = MagicMock()
+        mock_doc = MagicMock()
+        mock_doc.file_url = file_url
+        mock_doc.is_private = 1
+        mock_doc.attached_to_doctype = "Journal Entry"
+        mock_doc.attached_to_name = "JE-001"
+
+        mock_s3_ops = MagicMock()
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch(
+                "frappe_s3_attachment.controller.S3Operations",
+                return_value=mock_s3_ops,
+            ),
+        ):
+            from frappe_s3_attachment.controller import file_upload_to_s3
+
+            file_upload_to_s3(mock_doc, "after_insert")
+
+        return mock_s3_ops
+
+    def test_private_s3_url_is_not_reuploaded(self):
+        """A copied private attachment already on S3 must be skipped."""
+        url = (
+            "/api/method/frappe_s3_attachment.controller.generate_file"
+            "?key=2026/02/12/Journal Entry/ABC_file.pdf&file_name=file.pdf"
+        )
+        ops = self._run_hook(url)
+        ops.upload_files_to_s3_with_key.assert_not_called()
+
+    def test_public_s3_url_is_not_reuploaded(self):
+        """A copied public attachment already on S3 must be skipped."""
+        ops = self._run_hook("https://test-bucket.s3.amazonaws.com/key.pdf")
+        ops.upload_files_to_s3_with_key.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
