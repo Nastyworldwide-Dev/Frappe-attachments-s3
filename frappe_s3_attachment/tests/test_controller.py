@@ -124,5 +124,126 @@ class TestS3UploadACL(unittest.TestCase):
         self.assertNotIn("ACL", extra_args)
 
 
+class TestFileUploadToS3Guards(unittest.TestCase):
+    """Verify file_upload_to_s3 skips records that have no local file to upload.
+
+    Folders, File records without a file_url, and files whose local copy is
+    missing must not reach magic.from_file / S3 upload (which would raise
+    TypeError or FileNotFoundError).
+    """
+
+    def _run_hook(
+        self,
+        *,
+        file_url,
+        is_folder=0,
+        is_private=1,
+        local_exists=True,
+        attached_to_doctype="Journal Entry",
+    ):
+        mock_frappe = MagicMock()
+        mock_frappe.local.conf.get.return_value = None
+        mock_frappe.utils.get_site_path.return_value = "/site"
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch("frappe_s3_attachment.controller.S3Operations") as mock_ops,
+            patch("frappe_s3_attachment.controller.os") as mock_os,
+        ):
+            mock_os.path.exists.return_value = local_exists
+            mock_ops.return_value.upload_files_to_s3_with_key.return_value = "k"
+
+            from frappe_s3_attachment.controller import file_upload_to_s3
+
+            doc = MagicMock()
+            doc.file_url = file_url
+            doc.is_folder = is_folder
+            doc.is_private = is_private
+            doc.attached_to_doctype = attached_to_doctype
+            doc.attached_to_name = "X-1"
+            doc.file_name = "f.pdf"
+
+            file_upload_to_s3(doc, "after_insert")
+
+            return mock_ops.return_value.upload_files_to_s3_with_key.call_count
+
+    def test_skips_folder(self):
+        """Folder records (is_folder=1, no file_url) must be skipped."""
+        self.assertEqual(self._run_hook(file_url=None, is_folder=1), 0)
+
+    def test_skips_missing_file_url(self):
+        """File records without a file_url must be skipped (no TypeError)."""
+        self.assertEqual(self._run_hook(file_url=None), 0)
+
+    def test_skips_when_local_file_missing(self):
+        """A file whose local copy is absent must be skipped (no FileNotFound)."""
+        self.assertEqual(
+            self._run_hook(file_url="/private/files/f.pdf", local_exists=False), 0
+        )
+
+    def test_uploads_when_local_file_present(self):
+        """A genuine local file must still be uploaded to S3."""
+        self.assertEqual(
+            self._run_hook(file_url="/private/files/f.pdf", local_exists=True), 1
+        )
+
+
+class TestDeleteFromCloud(unittest.TestCase):
+    """Verify delete_from_cloud only deletes files actually stored on S3."""
+
+    def _run(self, *, file_url, content_hash):
+        mock_frappe = MagicMock()
+        captured = {"n": 0, "deleted_key": None}
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch("frappe_s3_attachment.controller.S3Operations") as mock_ops,
+        ):
+            inst = MagicMock()
+
+            def _del(key):
+                captured["deleted_key"] = key
+
+            inst.delete_from_s3.side_effect = _del
+
+            def _mark(*a, **k):
+                captured["n"] += 1
+                return inst
+
+            mock_ops.side_effect = _mark
+
+            from frappe_s3_attachment.controller import delete_from_cloud
+
+            doc = MagicMock()
+            doc.file_url = file_url
+            doc.content_hash = content_hash
+
+            delete_from_cloud(doc, "on_trash")
+
+        return captured
+
+    def test_skips_local_file(self):
+        """A local (non-S3) file must not trigger an S3 delete."""
+        r = self._run(file_url="/private/files/f.pdf", content_hash="abc123localhash")
+        self.assertEqual(r["n"], 0)
+
+    def test_skips_when_no_content_hash(self):
+        """A file without a content_hash (S3 key) must not trigger a delete."""
+        url = (
+            "/api/method/frappe_s3_attachment.controller.generate_file?key=2026/x_f.pdf"
+        )
+        r = self._run(file_url=url, content_hash=None)
+        self.assertEqual(r["n"], 0)
+
+    def test_deletes_s3_file(self):
+        """A genuine S3 file must be deleted using its S3 key."""
+        url = (
+            "/api/method/frappe_s3_attachment.controller.generate_file?key=2026/x_f.pdf"
+        )
+        r = self._run(file_url=url, content_hash="2026/x_f.pdf")
+        self.assertEqual(r["n"], 1)
+        self.assertEqual(r["deleted_key"], "2026/x_f.pdf")
+
+
 if __name__ == "__main__":
     unittest.main()

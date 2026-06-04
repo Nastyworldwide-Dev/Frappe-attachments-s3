@@ -1,6 +1,7 @@
 from __future__ import unicode_literals
 
 import datetime
+import logging
 import os
 import random
 import re
@@ -15,6 +16,9 @@ import frappe
 
 
 import magic
+
+
+logger = logging.getLogger(__name__)
 
 
 class S3Operations(object):
@@ -195,10 +199,13 @@ def file_upload_to_s3(doc, method):
     check and upload files to s3. the path check and
     """
     path = doc.file_url
+    # Folders and File records without an uploaded file have nothing to upload.
+    if getattr(doc, "is_folder", 0) or not path:
+        return
     # Skip files already on S3 (e.g. attachments copied from an amended-from
     # document). Their file_url is an S3 URL, not a local path, so trying to
     # re-upload would fail with FileNotFoundError.
-    if path and s3_file_regex_match(path):
+    if s3_file_regex_match(path):
         return
     s3_upload = S3Operations()
     site_path = frappe.utils.get_site_path()
@@ -212,6 +219,10 @@ def file_upload_to_s3(doc, method):
             file_path = site_path + "/public" + path
         else:
             file_path = site_path + path
+        # The local file must exist to be uploaded; if it is missing there is
+        # nothing to do (mirrors upload_existing_files_s3).
+        if not os.path.exists(file_path):
+            return
         key = s3_upload.upload_files_to_s3_with_key(
             file_path, doc.file_name, doc.is_private, parent_doctype, parent_name
         )
@@ -330,6 +341,14 @@ def migrate_existing_files():
 
 def delete_from_cloud(doc, method):
     """Delete file from s3"""
+    # Only S3-stored files carry an S3 key in content_hash. Local files have a
+    # content hash that is not an S3 key, so skip them to avoid issuing a
+    # delete with a bogus key (which can raise and block trashing the doc).
+    if not doc.content_hash or not (doc.file_url and s3_file_regex_match(doc.file_url)):
+        logger.debug(
+            "[s3_attachment] delete_from_cloud skipped for non-S3 file: %s", doc.name
+        )
+        return
     s3 = S3Operations()
     s3.delete_from_s3(doc.content_hash)
 
@@ -345,6 +364,10 @@ def ping():
 def update_has_attachment_flag(doc, method):
     """Update custom_has_attachment on parent document when files are added or removed."""
     if not doc.attached_to_doctype or not doc.attached_to_name:
+        return
+    # Guard against attachments pointing at a doctype that no longer exists;
+    # frappe.get_meta would raise for an unknown doctype.
+    if not frappe.db.exists("DocType", doc.attached_to_doctype):
         return
     if not frappe.get_meta(doc.attached_to_doctype).has_field("custom_has_attachment"):
         return
