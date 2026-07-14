@@ -124,6 +124,238 @@ class TestS3UploadACL(unittest.TestCase):
         self.assertNotIn("ACL", extra_args)
 
 
+class TestSecretReadViaGetPassword(unittest.TestCase):
+    """Verify the AWS secret is read from encrypted Password storage (SEC).
+
+    aws_secret was a plain Data field: readable in cleartext through the API
+    and archived in Version history. As a Password field it must be fetched
+    via get_password().
+    """
+
+    def _build_client(self, *, aws_key, secret):
+        mock_settings = MagicMock()
+        mock_settings.aws_key = aws_key
+        mock_settings.get_password.return_value = secret
+        mock_settings.region_name = "us-east-1"
+        mock_settings.bucket_name = "b"
+        mock_settings.folder_name = None
+
+        mock_frappe = MagicMock()
+        mock_frappe.get_doc.return_value = mock_settings
+
+        mock_boto3 = MagicMock()
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch("frappe_s3_attachment.controller.boto3", mock_boto3),
+        ):
+            from frappe_s3_attachment.controller import S3Operations
+
+            S3Operations()
+
+        return mock_settings, mock_boto3.client.call_args[1]
+
+    def test_secret_comes_from_get_password(self):
+        settings, kwargs = self._build_client(aws_key="AK", secret="decrypted-secret")
+        settings.get_password.assert_called_once_with(
+            "aws_secret", raise_exception=False
+        )
+        self.assertEqual(kwargs.get("aws_secret_access_key"), "decrypted-secret")
+
+    def test_missing_secret_falls_back_to_default_credential_chain(self):
+        _, kwargs = self._build_client(aws_key="AK", secret=None)
+        self.assertNotIn("aws_secret_access_key", kwargs)
+
+
+class TestEncryptAwsSecretPatch(unittest.TestCase):
+    """Verify the one-time patch encrypts the plaintext secret and purges history."""
+
+    def _run_patch(self, *, plaintext):
+        mock_frappe = MagicMock()
+        mock_frappe.db.get_value.return_value = plaintext
+
+        with (
+            patch(
+                "frappe_s3_attachment.patches.encrypt_aws_secret.frappe", mock_frappe
+            ),
+            patch(
+                "frappe.utils.password.set_encrypted_password", create=True
+            ) as mock_set,
+        ):
+            from frappe_s3_attachment.patches.encrypt_aws_secret import execute
+
+            execute()
+
+        return mock_frappe, mock_set
+
+    def test_plaintext_secret_is_encrypted_and_masked(self):
+        mock_frappe, mock_set = self._run_patch(plaintext="old-plain-secret")
+        mock_set.assert_called_once_with(
+            "S3 File Attachment", "S3 File Attachment", "old-plain-secret", "aws_secret"
+        )
+        mock_frappe.db.set_single_value.assert_called_once()
+        mock_frappe.db.delete.assert_called_once_with(
+            "Version", {"ref_doctype": "S3 File Attachment"}
+        )
+
+    def test_no_secret_still_purges_versions_without_encrypting(self):
+        mock_frappe, mock_set = self._run_patch(plaintext=None)
+        self.assertEqual(mock_set.call_count, 0)
+        mock_frappe.db.delete.assert_called_once()
+
+
+class TestUploadMetadataAscii(unittest.TestCase):
+    """Verify uploads survive non-ASCII file names (M).
+
+    S3 user metadata must be ASCII; sending a raw non-ASCII file_name makes
+    boto3 raise and blocks the whole document save.
+    """
+
+    def _run_upload(self, file_name):
+        mock_settings = MagicMock()
+        mock_settings.aws_key = "test-key"
+        mock_settings.aws_secret = "test-secret"
+        mock_settings.region_name = "us-east-1"
+        mock_settings.bucket_name = "test-bucket"
+        mock_settings.folder_name = "test-folder"
+
+        mock_frappe = MagicMock()
+        mock_frappe.get_doc.return_value = mock_settings
+        mock_frappe.local.conf.get.return_value = None
+
+        mock_magic = MagicMock()
+        mock_magic.from_file.return_value = "application/pdf"
+
+        mock_client = MagicMock()
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = mock_client
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch("frappe_s3_attachment.controller.boto3", mock_boto3),
+            patch("frappe_s3_attachment.controller.magic", mock_magic),
+        ):
+            from frappe_s3_attachment.controller import S3Operations
+
+            ops = S3Operations()
+            ops.S3_CLIENT = mock_client
+            ops.key_generator = MagicMock(return_value="test-folder/K_test.pdf")
+            ops.upload_files_to_s3_with_key(
+                "/tmp/test.pdf",
+                file_name,
+                is_private=True,
+                parent_doctype="Sales Invoice",
+                parent_name="SI-001",
+            )
+
+        return mock_client.upload_file.call_args[1]["ExtraArgs"]
+
+    def test_non_ascii_file_name_is_encoded_and_reversible(self):
+        from urllib.parse import unquote
+
+        meta = self._run_upload("リポート.pdf")["Metadata"]["file_name"]
+        meta.encode("ascii")  # must not raise
+        self.assertEqual(unquote(meta), "リポート.pdf")
+
+    def test_ascii_file_name_unchanged(self):
+        meta = self._run_upload("report.pdf")["Metadata"]["file_name"]
+        self.assertEqual(meta, "report.pdf")
+
+
+class TestGetUrlContentDisposition(unittest.TestCase):
+    """Verify get_url sends a valid, header-safe Content-Disposition (M)."""
+
+    def _params(self, file_name):
+        mock_settings = MagicMock()
+        mock_settings.aws_key = "k"
+        mock_settings.aws_secret = "s"
+        mock_settings.region_name = "us-east-1"
+        mock_settings.bucket_name = "b"
+        mock_settings.folder_name = None
+        mock_settings.signed_url_expiry_time = 120
+
+        mock_frappe = MagicMock()
+        mock_frappe.get_doc.return_value = mock_settings
+
+        mock_client = MagicMock()
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = mock_client
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch("frappe_s3_attachment.controller.boto3", mock_boto3),
+        ):
+            from frappe_s3_attachment.controller import S3Operations
+
+            ops = S3Operations()
+            ops.S3_CLIENT = mock_client
+            ops.get_url("2026/k_f.pdf", file_name)
+
+        return mock_client.generate_presigned_url.call_args[1]["Params"]
+
+    def test_disposition_is_valid_inline(self):
+        p = self._params("report.pdf")
+        self.assertEqual(
+            p["ResponseContentDisposition"], 'inline; filename="report.pdf"'
+        )
+
+    def test_disposition_survives_hostile_file_name(self):
+        v = self._params('リポ"ー\r\nト evil.pdf')["ResponseContentDisposition"]
+        v.encode("ascii")  # must not raise
+        self.assertNotIn("\r", v)
+        self.assertNotIn("\n", v)
+        self.assertTrue(v.startswith('inline; filename="'))
+        self.assertTrue(v.endswith('"'))
+        inner = v[len('inline; filename="') : -1]
+        self.assertNotIn('"', inner)
+
+
+class TestDeleteFromS3ErrorReason(unittest.TestCase):
+    """Verify delete_from_s3 surfaces the real S3 error, not 'Access denied' (M)."""
+
+    def _run_failing_delete(self, exc):
+        mock_settings = MagicMock()
+        mock_settings.delete_file_from_cloud = True
+        mock_settings.bucket_name = "b"
+
+        mock_frappe = MagicMock()
+        mock_frappe.get_doc.return_value = mock_settings
+        mock_frappe._ = lambda s: s
+
+        mock_client = MagicMock()
+        mock_client.delete_object.side_effect = exc
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = mock_client
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch("frappe_s3_attachment.controller.boto3", mock_boto3),
+        ):
+            from frappe_s3_attachment.controller import S3Operations
+
+            ops = S3Operations()
+            ops.S3_CLIENT = mock_client
+            ops.delete_from_s3("2026/k_f.pdf")
+
+        return mock_frappe.throw.call_args[0][0]
+
+    def test_client_error_code_is_surfaced(self):
+        from botocore.exceptions import ClientError
+
+        msg = self._run_failing_delete(
+            ClientError({"Error": {"Code": "NoSuchBucket"}}, "DeleteObject")
+        )
+        self.assertIn("NoSuchBucket", msg)
+
+    def test_connection_error_is_caught_and_named(self):
+        from botocore.exceptions import EndpointConnectionError
+
+        msg = self._run_failing_delete(
+            EndpointConnectionError(endpoint_url="https://s3.example.com")
+        )
+        self.assertIn("EndpointConnectionError", msg)
+
+
 class TestFileUploadToS3Guards(unittest.TestCase):
     """Verify file_upload_to_s3 skips records that have no local file to upload.
 
@@ -141,6 +373,8 @@ class TestFileUploadToS3Guards(unittest.TestCase):
         local_exists=True,
         other_local_refs=0,
         attached_to_doctype="Journal Entry",
+        file_name="f.pdf",
+        key="k",
     ):
         mock_frappe = MagicMock()
         mock_frappe.local.conf.get.return_value = None
@@ -154,7 +388,7 @@ class TestFileUploadToS3Guards(unittest.TestCase):
             patch("frappe_s3_attachment.controller.os") as mock_os,
         ):
             mock_os.path.exists.return_value = local_exists
-            mock_ops.return_value.upload_files_to_s3_with_key.return_value = "k"
+            mock_ops.return_value.upload_files_to_s3_with_key.return_value = key
 
             from frappe_s3_attachment.controller import file_upload_to_s3
 
@@ -164,13 +398,22 @@ class TestFileUploadToS3Guards(unittest.TestCase):
             doc.is_private = is_private
             doc.attached_to_doctype = attached_to_doctype
             doc.attached_to_name = "X-1"
-            doc.file_name = "f.pdf"
+            doc.file_name = file_name
 
             file_upload_to_s3(doc, "after_insert")
 
+            # Removals must be scheduled for after-commit, not run inline;
+            # "removes" reflects what happens once the transaction commits.
+            removes_immediate = mock_os.remove.call_count
+            for call in mock_frappe.db.after_commit.add.call_args_list:
+                call[0][0]()
+
+            sql_call = mock_frappe.db.sql.call_args
             return {
                 "uploads": mock_ops.return_value.upload_files_to_s3_with_key.call_count,
+                "removes_immediate": removes_immediate,
                 "removes": mock_os.remove.call_count,
+                "file_url": sql_call[0][1][0] if sql_call else None,
             }
 
     def test_skips_folder(self):
@@ -210,6 +453,32 @@ class TestFileUploadToS3Guards(unittest.TestCase):
         r = self._run_hook(file_url="/private/files/f.pdf", other_local_refs=2)
         self.assertEqual(r["uploads"], 1)
         self.assertEqual(r["removes"], 0)
+
+    def test_removal_is_deferred_until_commit(self):
+        """The local file must not be deleted inside the transaction (H4).
+
+        A rollback after the hook ran would revert the row to a local
+        file_url whose file was already deleted — the attachment is lost.
+        """
+        r = self._run_hook(file_url="/private/files/f.pdf", other_local_refs=0)
+        self.assertEqual(r["removes_immediate"], 0)
+        self.assertEqual(r["removes"], 1)
+
+    def test_private_file_url_query_is_encoded(self):
+        """Keys contain spaces (doctype names) and file names may contain
+        '&' or '#'; unencoded they truncate the query and break download (M)."""
+        from urllib.parse import parse_qs
+
+        r = self._run_hook(
+            file_url="/private/files/f.pdf",
+            key="2026/07/14/Purchase Order/K1_x.pdf",
+            file_name="P&L report.pdf",
+        )
+        query = r["file_url"].split("?", 1)[1]
+        self.assertNotIn(" ", query)
+        parsed = parse_qs(query)
+        self.assertEqual(parsed["key"][0], "2026/07/14/Purchase Order/K1_x.pdf")
+        self.assertEqual(parsed["file_name"][0], "P&L report.pdf")
 
 
 class TestDeleteFromCloud(unittest.TestCase):
@@ -277,6 +546,116 @@ class TestDeleteFromCloud(unittest.TestCase):
         )
         r = self._run(file_url=url, content_hash="2026/x_f.pdf", shared_count=2)
         self.assertEqual(r["n"], 0)
+
+
+class TestDeleteSharedKeyInFileUrl(unittest.TestCase):
+    """Verify delete_from_cloud sees references that live only in file_url (H3).
+
+    Amending a document copies its attachments into File records whose
+    file_url contains the S3 key but whose content_hash is empty (19 such
+    records exist in live data). Deleting the original must not delete the
+    S3 object those copies still point at.
+    """
+
+    def _run(self, *, hash_refs, url_refs):
+        mock_frappe = MagicMock()
+        mock_frappe.local._s3_operations = None
+
+        def _count(doctype, filters):
+            if "content_hash" in filters:
+                return hash_refs
+            return url_refs
+
+        mock_frappe.db.count.side_effect = _count
+        deleted = {"n": 0}
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch("frappe_s3_attachment.controller.S3Operations") as mock_ops,
+        ):
+            mock_ops.return_value.delete_from_s3.side_effect = lambda key: (
+                deleted.__setitem__("n", deleted["n"] + 1)
+            )
+
+            from frappe_s3_attachment.controller import delete_from_cloud
+
+            doc = MagicMock()
+            doc.name = "F-original"
+            doc.content_hash = "2026/05/18/Purchase Order/1TLG3BY1_x.pdf"
+            doc.file_url = (
+                "/api/method/frappe_s3_attachment.controller.generate_file"
+                "?key=2026/05/18/Purchase Order/1TLG3BY1_x.pdf"
+            )
+            delete_from_cloud(doc, "on_trash")
+
+        return deleted["n"]
+
+    def test_skips_when_key_referenced_only_in_file_url(self):
+        """Copies without content_hash must still protect the S3 object."""
+        self.assertEqual(self._run(hash_refs=0, url_refs=1), 0)
+
+    def test_deletes_when_nothing_references_key(self):
+        self.assertEqual(self._run(hash_refs=0, url_refs=0), 1)
+
+
+class TestGenerateFileAuthKeyInFileUrl(unittest.TestCase):
+    """Verify _check_file_access finds files whose key lives only in file_url (H3).
+
+    If the original File row (the one carrying content_hash == key) is deleted,
+    amended-document copies must remain downloadable via their file_url.
+    """
+
+    def _run(self, *, url_match_files, has_perm=True):
+        import types as _types
+
+        mock_frappe = MagicMock()
+        mock_frappe.local._s3_operations = None
+        mock_frappe.PermissionError = type("PermissionError", (Exception,), {})
+        mock_frappe._ = lambda s: s
+        mock_frappe.has_permission.return_value = has_perm
+
+        def _get_all(doctype, filters=None, fields=None):
+            if "content_hash" in (filters or {}):
+                return []
+            return [_types.SimpleNamespace(**f) for f in url_match_files]
+
+        mock_frappe.get_all.side_effect = _get_all
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch("frappe_s3_attachment.controller.S3Operations") as mock_ops,
+        ):
+            mock_ops.return_value.get_url.return_value = "https://signed"
+            from frappe_s3_attachment.controller import generate_file
+
+            try:
+                generate_file(
+                    key="2026/05/18/Purchase Order/1TLG3BY1_x.pdf",
+                    file_name="x.pdf",
+                )
+                denied = False
+            except mock_frappe.PermissionError:
+                denied = True
+
+        return denied
+
+    def test_copy_with_key_in_file_url_is_accessible(self):
+        f = {
+            "name": "F-copy",
+            "is_private": 1,
+            "attached_to_doctype": "Purchase Order",
+            "attached_to_name": "PO-1",
+        }
+        self.assertFalse(self._run(url_match_files=[f], has_perm=True))
+
+    def test_copy_without_permission_still_denied(self):
+        f = {
+            "name": "F-copy",
+            "is_private": 1,
+            "attached_to_doctype": "Purchase Order",
+            "attached_to_name": "PO-1",
+        }
+        self.assertTrue(self._run(url_match_files=[f], has_perm=False))
 
 
 class TestGenerateFileAuth(unittest.TestCase):
@@ -353,9 +732,9 @@ class TestGenerateFileAuth(unittest.TestCase):
 class TestUploadErrorHandling(unittest.TestCase):
     """Verify S3 client errors during upload are surfaced via frappe.throw (M2)."""
 
-    def test_client_error_is_caught(self):
+    def _run_failing_upload(self, exc):
+        """Run an upload whose S3 client raises ``exc``; return the mock_frappe."""
         import boto3 as real_boto3
-        from botocore.exceptions import ClientError
 
         mock_settings = MagicMock()
         mock_settings.aws_key = "k"
@@ -373,9 +752,7 @@ class TestUploadErrorHandling(unittest.TestCase):
         mock_magic.from_file.return_value = "application/pdf"
 
         mock_client = MagicMock()
-        mock_client.upload_file.side_effect = ClientError(
-            {"Error": {"Code": "AccessDenied"}}, "PutObject"
-        )
+        mock_client.upload_file.side_effect = exc
         mock_boto3 = MagicMock()
         mock_boto3.client.return_value = mock_client
         mock_boto3.exceptions = real_boto3.exceptions  # keep real exception classes
@@ -394,7 +771,333 @@ class TestUploadErrorHandling(unittest.TestCase):
                 "/tmp/x.pdf", "x.pdf", True, "DocType", "n1"
             )
 
+        return mock_frappe
+
+    def test_client_error_is_caught(self):
+        from botocore.exceptions import ClientError
+
+        mock_frappe = self._run_failing_upload(
+            ClientError({"Error": {"Code": "AccessDenied"}}, "PutObject")
+        )
         self.assertTrue(mock_frappe.throw.called)
+
+    def test_thrown_message_includes_s3_error_code(self):
+        """The thrown message must surface the real S3 error code so the
+        admin can diagnose the failure without reading server logs."""
+        from botocore.exceptions import ClientError
+
+        mock_frappe = self._run_failing_upload(
+            ClientError({"Error": {"Code": "NoSuchBucket"}}, "PutObject")
+        )
+        thrown_msg = mock_frappe.throw.call_args[0][0]
+        self.assertIn("NoSuchBucket", thrown_msg)
+
+    def test_thrown_message_includes_connection_error_name(self):
+        """A connection failure (no error code) must still name the cause."""
+        from botocore.exceptions import EndpointConnectionError
+
+        mock_frappe = self._run_failing_upload(
+            EndpointConnectionError(endpoint_url="https://s3.example.com")
+        )
+        thrown_msg = mock_frappe.throw.call_args[0][0]
+        self.assertIn("EndpointConnectionError", thrown_msg)
+
+
+class TestS3ErrorReason(unittest.TestCase):
+    """Verify _s3_error_reason extracts a concise, user-safe failure reason."""
+
+    def test_client_error_returns_aws_code(self):
+        from botocore.exceptions import ClientError
+
+        from frappe_s3_attachment.controller import _s3_error_reason
+
+        e = ClientError({"Error": {"Code": "AccessDenied"}}, "PutObject")
+        self.assertEqual(_s3_error_reason(e), "AccessDenied")
+
+    def test_client_error_without_code_falls_back_to_class_name(self):
+        from botocore.exceptions import ClientError
+
+        from frappe_s3_attachment.controller import _s3_error_reason
+
+        e = ClientError({"Error": {}}, "PutObject")
+        self.assertEqual(_s3_error_reason(e), "ClientError")
+
+    def test_botocore_error_returns_class_name(self):
+        from botocore.exceptions import EndpointConnectionError
+
+        from frappe_s3_attachment.controller import _s3_error_reason
+
+        e = EndpointConnectionError(endpoint_url="https://s3.example.com")
+        self.assertEqual(_s3_error_reason(e), "EndpointConnectionError")
+
+
+class TestMigrationSingleFileUpload(unittest.TestCase):
+    """Verify upload_existing_files_s3 handles the edge cases found in live data.
+
+    H1: files not attached to any doctype must fall back to "File" instead of
+    concatenating None into the S3 key (TypeError that kills the whole job).
+    H2: a local file shared by several File records must not be deleted while
+    other records still reference it (mirrors file_upload_to_s3).
+    """
+
+    def _run(
+        self,
+        *,
+        attached_to_doctype="Journal Entry",
+        file_name="f.pdf",
+        other_local_refs=0,
+        local_exists=True,
+        key="2026/07/14/X/KEY12345_f.pdf",
+    ):
+        mock_frappe = MagicMock()
+        mock_frappe.local._s3_operations = None
+        mock_frappe.utils.get_site_path.return_value = "/site"
+        mock_frappe.db.count.return_value = other_local_refs
+
+        doc = MagicMock()
+        doc.name = "F1"
+        doc.file_url = "/private/files/f.pdf"
+        doc.is_private = 1
+        doc.attached_to_doctype = attached_to_doctype
+        doc.attached_to_name = None
+        doc.file_name = file_name
+        mock_frappe.get_doc.return_value = doc
+
+        captured = {}
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch("frappe_s3_attachment.controller.S3Operations") as mock_ops,
+            patch("frappe_s3_attachment.controller.os") as mock_os,
+        ):
+            mock_os.path.exists.return_value = local_exists
+            mock_os.path.basename.side_effect = lambda p: p.rsplit("/", 1)[-1]
+
+            def _upload(file_path, file_name, is_private, parent_doctype, parent_name):
+                captured["file_name"] = file_name
+                captured["parent_doctype"] = parent_doctype
+                return key
+
+            mock_ops.return_value.upload_files_to_s3_with_key.side_effect = _upload
+
+            from frappe_s3_attachment.controller import upload_existing_files_s3
+
+            captured["result"] = upload_existing_files_s3("F1")
+            # Execute any deferred after-commit callbacks so "removes" reflects
+            # what would happen once the transaction commits.
+            for call in mock_frappe.db.after_commit.add.call_args_list:
+                call[0][0]()
+            captured["removes"] = mock_os.remove.call_count
+            sql_call = mock_frappe.db.sql.call_args
+            captured["file_url"] = sql_call[0][1][0] if sql_call else None
+
+        return captured
+
+    def test_unattached_file_uses_file_fallback_doctype(self):
+        """A File with no attached_to_doctype must migrate under "File" (H1)."""
+        r = self._run(attached_to_doctype=None)
+        self.assertEqual(r["parent_doctype"], "File")
+        self.assertTrue(r["result"])
+
+    def test_missing_file_name_falls_back_to_basename(self):
+        """A File row without file_name must not crash key generation (H1)."""
+        r = self._run(file_name=None)
+        self.assertEqual(r["file_name"], "f.pdf")
+
+    def test_keeps_shared_local_file(self):
+        """The local file must survive while other records still use it (H2)."""
+        r = self._run(other_local_refs=1)
+        self.assertEqual(r["removes"], 0)
+
+    def test_removes_local_file_when_last_reference(self):
+        """The local file is removed once no other record references it."""
+        r = self._run(other_local_refs=0)
+        self.assertEqual(r["removes"], 1)
+
+    def test_returns_false_when_local_file_missing(self):
+        """A missing local file is reported as skipped, not uploaded."""
+        r = self._run(local_exists=False)
+        self.assertFalse(r["result"])
+
+    def test_migrated_private_url_query_is_encoded(self):
+        """The migration path must produce the same encoded URLs as the hook (M)."""
+        from urllib.parse import parse_qs
+
+        r = self._run(
+            key="2026/07/14/Purchase Order/K1_x.pdf", file_name="P&L report.pdf"
+        )
+        query = r["file_url"].split("?", 1)[1]
+        self.assertNotIn(" ", query)
+        parsed = parse_qs(query)
+        self.assertEqual(parsed["key"][0], "2026/07/14/Purchase Order/K1_x.pdf")
+        self.assertEqual(parsed["file_name"][0], "P&L report.pdf")
+
+
+class TestMigrationJob(unittest.TestCase):
+    """Verify _migrate_existing_files isolates failures and respects skip rules."""
+
+    def _run(self, files, *, upload=None, conf_ignore=None):
+        mock_frappe = MagicMock()
+        mock_frappe.local.conf.get.return_value = conf_ignore
+        mock_frappe.get_all.return_value = files
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch(
+                "frappe_s3_attachment.controller.upload_existing_files_s3"
+            ) as mock_up,
+        ):
+            if upload:
+                mock_up.side_effect = upload
+            else:
+                mock_up.return_value = True
+
+            from frappe_s3_attachment.controller import _migrate_existing_files
+
+            summary = _migrate_existing_files(user="admin@example.com")
+
+        return summary, mock_up, mock_frappe
+
+    def _local(self, name, doctype="Journal Entry"):
+        return {
+            "name": name,
+            "file_url": "/private/files/{}.pdf".format(name),
+            "attached_to_doctype": doctype,
+        }
+
+    def test_one_failure_does_not_abort_the_job(self):
+        """A file that fails must be recorded; the rest still migrate (H1)."""
+
+        def upload(name):
+            if name == "F2":
+                raise TypeError("can only concatenate str")
+            return True
+
+        files = [self._local("F1"), self._local("F2"), self._local("F3")]
+        summary, mock_up, _ = self._run(files, upload=upload)
+        self.assertEqual(mock_up.call_count, 3)
+        self.assertEqual(summary["migrated"], 2)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(len(summary["failures"]), 1)
+
+    def test_skips_ignored_doctype(self):
+        """Files attached to an ignored doctype must not be migrated."""
+        files = [self._local("F1"), self._local("F2", doctype="Data Import")]
+        summary, mock_up, _ = self._run(files)
+        self.assertEqual(mock_up.call_count, 1)
+        self.assertEqual(summary["migrated"], 1)
+        self.assertEqual(summary["skipped"], 1)
+
+    def test_skips_files_already_on_s3(self):
+        """Already-migrated files and folders must not be re-uploaded."""
+        files = [
+            self._local("F1"),
+            {
+                "name": "F2",
+                "file_url": (
+                    "/api/method/frappe_s3_attachment.controller.generate_file?key=k"
+                ),
+                "attached_to_doctype": "Journal Entry",
+            },
+            {"name": "F3", "file_url": None, "attached_to_doctype": None},
+        ]
+        _, mock_up, _ = self._run(files)
+        self.assertEqual(mock_up.call_count, 1)
+
+    def test_publishes_completion_event(self):
+        """The job must publish a completion summary for the settings page UI."""
+        summary, _, mock_frappe = self._run([self._local("F1")])
+        events = [c[0][0] for c in mock_frappe.publish_realtime.call_args_list]
+        self.assertIn("s3_migration_complete", events)
+        self.assertEqual(summary["migrated"], 1)
+
+
+class TestMigrateEnqueueGuard(unittest.TestCase):
+    """Verify migrate_existing_files cannot start duplicate concurrent jobs."""
+
+    def _run(self, *, already_running):
+        mock_frappe = MagicMock()
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch(
+                "frappe.utils.background_jobs.is_job_enqueued",
+                return_value=already_running,
+                create=True,
+            ),
+        ):
+            from frappe_s3_attachment.controller import migrate_existing_files
+
+            result = migrate_existing_files()
+        return result, mock_frappe
+
+    def test_second_click_does_not_enqueue(self):
+        result, mock_frappe = self._run(already_running=True)
+        self.assertEqual(result["status"], "already_running")
+        self.assertEqual(mock_frappe.enqueue.call_count, 0)
+
+    def test_first_click_enqueues_with_job_id(self):
+        result, mock_frappe = self._run(already_running=False)
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(mock_frappe.enqueue.call_count, 1)
+        self.assertIn("job_id", mock_frappe.enqueue.call_args[1])
+
+
+class TestGetMigrationSummary(unittest.TestCase):
+    """Verify the pre-migration summary counts shown in the confirm dialog."""
+
+    def test_counts(self):
+        mock_frappe = MagicMock()
+        mock_frappe.local.conf.get.return_value = None
+        mock_frappe.get_all.return_value = [
+            # two migratable local files sharing one physical file
+            {
+                "name": "F1",
+                "file_url": "/private/files/a.csv",
+                "attached_to_doctype": "Journal Entry",
+            },
+            {
+                "name": "F2",
+                "file_url": "/private/files/a.csv",
+                "attached_to_doctype": "Journal Entry",
+            },
+            # unattached local file
+            {
+                "name": "F3",
+                "file_url": "/private/files/b.html",
+                "attached_to_doctype": None,
+            },
+            # ignored doctype
+            {
+                "name": "F4",
+                "file_url": "/private/files/c.csv",
+                "attached_to_doctype": "Data Import",
+            },
+            # already migrated
+            {
+                "name": "F5",
+                "file_url": "/api/method/frappe_s3_attachment.controller.generate_file?key=k",
+                "attached_to_doctype": "Journal Entry",
+            },
+        ]
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch(
+                "frappe.utils.background_jobs.is_job_enqueued",
+                return_value=False,
+                create=True,
+            ),
+        ):
+            from frappe_s3_attachment.controller import get_migration_summary
+
+            s = get_migration_summary()
+
+        self.assertEqual(s["total_local"], 4)
+        self.assertEqual(s["skipped_ignored"], 1)
+        self.assertEqual(s["will_upload"], 3)
+        self.assertEqual(s["unattached"], 1)
+        self.assertEqual(s["shared_local"], 1)
+        self.assertFalse(s["running"])
 
 
 class TestIsS3File(unittest.TestCase):

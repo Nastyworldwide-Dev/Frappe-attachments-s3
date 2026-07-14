@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
-from . import __version__ as app_version
+
+from . import __version__ as app_version  # noqa: F401 - bench reads app_version from hooks
 
 app_name = "frappe_s3_attachment"
 app_title = "Frappe S3 Attachment"
