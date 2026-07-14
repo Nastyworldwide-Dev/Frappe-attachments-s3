@@ -203,6 +203,17 @@ class TestEncryptAwsSecretPatch(unittest.TestCase):
         self.assertEqual(mock_set.call_count, 0)
         mock_frappe.db.delete.assert_called_once()
 
+    def test_singles_read_disables_default_ordering(self):
+        # tabSingles has no `modified` column; get_value's default ordering
+        # raises OperationalError 1054 during migrate unless order_by=None.
+        mock_frappe, _ = self._run_patch(plaintext="old-plain-secret")
+        mock_frappe.db.get_value.assert_called_once_with(
+            "Singles",
+            {"doctype": "S3 File Attachment", "field": "aws_secret"},
+            "value",
+            order_by=None,
+        )
+
 
 class TestUploadMetadataAscii(unittest.TestCase):
     """Verify uploads survive non-ASCII file names (M).

@@ -13,8 +13,12 @@ def execute():
     plaintext copies.
     """
     frappe.reload_doc("frappe_s3_attachment", "doctype", "s3_file_attachment")
+    # tabSingles has no `modified` column, so default ordering breaks the query.
     plaintext = frappe.db.get_value(
-        "Singles", {"doctype": "S3 File Attachment", "field": "aws_secret"}, "value"
+        "Singles",
+        {"doctype": "S3 File Attachment", "field": "aws_secret"},
+        "value",
+        order_by=None,
     )
     if plaintext and plaintext != "*":
         from frappe.utils.password import set_encrypted_password
