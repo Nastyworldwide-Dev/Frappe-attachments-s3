@@ -548,6 +548,18 @@ class TestDeleteFromCloud(unittest.TestCase):
         self.assertEqual(r["n"], 0)
 
 
+KEY = "2026/05/18/Purchase Order/1TLG3BY1_x.pdf"
+
+
+def _private_url(key):
+    from urllib.parse import quote
+
+    return (
+        "/api/method/frappe_s3_attachment.controller.generate_file"
+        "?key={}&file_name=x.pdf".format(quote(key))
+    )
+
+
 class TestDeleteSharedKeyInFileUrl(unittest.TestCase):
     """Verify delete_from_cloud sees references that live only in file_url (H3).
 
@@ -557,16 +569,15 @@ class TestDeleteSharedKeyInFileUrl(unittest.TestCase):
     S3 object those copies still point at.
     """
 
-    def _run(self, *, hash_refs, url_refs):
+    def _run(self, *, hash_refs, url_files):
+        import types as _types
+
         mock_frappe = MagicMock()
         mock_frappe.local._s3_operations = None
-
-        def _count(doctype, filters):
-            if "content_hash" in filters:
-                return hash_refs
-            return url_refs
-
-        mock_frappe.db.count.side_effect = _count
+        mock_frappe.db.count.return_value = hash_refs
+        mock_frappe.get_all.return_value = [
+            _types.SimpleNamespace(**f) for f in url_files
+        ]
         deleted = {"n": 0}
 
         with (
@@ -581,28 +592,32 @@ class TestDeleteSharedKeyInFileUrl(unittest.TestCase):
 
             doc = MagicMock()
             doc.name = "F-original"
-            doc.content_hash = "2026/05/18/Purchase Order/1TLG3BY1_x.pdf"
-            doc.file_url = (
-                "/api/method/frappe_s3_attachment.controller.generate_file"
-                "?key=2026/05/18/Purchase Order/1TLG3BY1_x.pdf"
-            )
+            doc.content_hash = KEY
+            doc.file_url = _private_url(KEY)
             delete_from_cloud(doc, "on_trash")
 
         return deleted["n"]
 
     def test_skips_when_key_referenced_only_in_file_url(self):
         """Copies without content_hash must still protect the S3 object."""
-        self.assertEqual(self._run(hash_refs=0, url_refs=1), 0)
+        n = self._run(hash_refs=0, url_files=[{"file_url": _private_url(KEY)}])
+        self.assertEqual(n, 0)
 
     def test_deletes_when_nothing_references_key(self):
-        self.assertEqual(self._run(hash_refs=0, url_refs=0), 1)
+        self.assertEqual(self._run(hash_refs=0, url_files=[]), 1)
+
+    def test_deletes_despite_like_overmatch_of_unrelated_file(self):
+        """A file_url that only shares a substring must not block deletion (SEC-01)."""
+        overmatch = {"file_url": _private_url("OTHER/1TLG3BY1_x.pdf.different")}
+        self.assertEqual(self._run(hash_refs=0, url_files=[overmatch]), 1)
 
 
 class TestGenerateFileAuthKeyInFileUrl(unittest.TestCase):
     """Verify _check_file_access finds files whose key lives only in file_url (H3).
 
     If the original File row (the one carrying content_hash == key) is deleted,
-    amended-document copies must remain downloadable via their file_url.
+    amended-document copies must remain downloadable via their file_url — but a
+    mere substring over-match must NOT grant access to a different object (SEC-01).
     """
 
     def _run(self, *, url_match_files, has_perm=True):
@@ -613,6 +628,7 @@ class TestGenerateFileAuthKeyInFileUrl(unittest.TestCase):
         mock_frappe.PermissionError = type("PermissionError", (Exception,), {})
         mock_frappe._ = lambda s: s
         mock_frappe.has_permission.return_value = has_perm
+        signed = {"n": 0}
 
         def _get_all(doctype, filters=None, fields=None):
             if "content_hash" in (filters or {}):
@@ -625,37 +641,53 @@ class TestGenerateFileAuthKeyInFileUrl(unittest.TestCase):
             patch("frappe_s3_attachment.controller.frappe", mock_frappe),
             patch("frappe_s3_attachment.controller.S3Operations") as mock_ops,
         ):
-            mock_ops.return_value.get_url.return_value = "https://signed"
+            mock_ops.return_value.get_url.side_effect = lambda *a, **k: (
+                signed.__setitem__("n", signed["n"] + 1) or "https://signed"
+            )
             from frappe_s3_attachment.controller import generate_file
 
             try:
-                generate_file(
-                    key="2026/05/18/Purchase Order/1TLG3BY1_x.pdf",
-                    file_name="x.pdf",
-                )
+                generate_file(key=KEY, file_name="x.pdf")
                 denied = False
             except mock_frappe.PermissionError:
                 denied = True
 
-        return denied
+        return denied, signed["n"]
+
+    def _copy(self, **over):
+        f = {
+            "name": "F-copy",
+            "is_private": 1,
+            "attached_to_doctype": "Purchase Order",
+            "attached_to_name": "PO-1",
+            "file_url": _private_url(KEY),
+        }
+        f.update(over)
+        return f
 
     def test_copy_with_key_in_file_url_is_accessible(self):
-        f = {
-            "name": "F-copy",
-            "is_private": 1,
-            "attached_to_doctype": "Purchase Order",
-            "attached_to_name": "PO-1",
-        }
-        self.assertFalse(self._run(url_match_files=[f], has_perm=True))
+        denied, signed = self._run(url_match_files=[self._copy()], has_perm=True)
+        self.assertFalse(denied)
+        self.assertEqual(signed, 1)
 
     def test_copy_without_permission_still_denied(self):
-        f = {
-            "name": "F-copy",
-            "is_private": 1,
-            "attached_to_doctype": "Purchase Order",
-            "attached_to_name": "PO-1",
-        }
-        self.assertTrue(self._run(url_match_files=[f], has_perm=False))
+        denied, signed = self._run(url_match_files=[self._copy()], has_perm=False)
+        self.assertTrue(denied)
+        self.assertEqual(signed, 0)
+
+    def test_overmatched_public_file_does_not_grant_access(self):
+        """A public file whose url only shares a substring with the requested
+        key must not pass the permission gate or get signed (SEC-01)."""
+        unrelated = self._copy(
+            name="F-other",
+            is_private=0,
+            attached_to_doctype=None,
+            attached_to_name=None,
+            file_url=_private_url("SOMEWHERE/1TLG3BY1_x.pdf.other"),
+        )
+        denied, signed = self._run(url_match_files=[unrelated], has_perm=True)
+        self.assertTrue(denied)
+        self.assertEqual(signed, 0)
 
 
 class TestGenerateFileAuth(unittest.TestCase):

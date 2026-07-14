@@ -7,7 +7,7 @@ import random
 import re
 import string
 
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 import boto3
 
@@ -397,6 +397,33 @@ def _key_url_variants(key):
     return {key, quote(key)}
 
 
+def _escape_like(value):
+    """Escape SQL LIKE wildcards so a user-supplied key can't act as a pattern.
+
+    Frappe parameterises LIKE values against injection but does not neutralise
+    the % and _ wildcards; the app's own keys contain '_', so an unescaped key
+    would silently match unrelated file_urls.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _file_url_references_key(file_url, key):
+    """True only if file_url points at exactly this S3 key.
+
+    A LIKE substring match is used only to narrow candidates; unlike a
+    content_hash equality it does not guarantee the same object, so the key is
+    verified precisely here before any access or delete decision is made.
+    """
+    if not file_url:
+        return False
+    parsed = urlparse(file_url)
+    key_params = parse_qs(parsed.query).get("key")
+    if key_params is not None:
+        return key in key_params
+    # Public files store the key as the URL-encoded tail of the path.
+    return parsed.path.endswith("/" + quote(key)) or parsed.path.endswith("/" + key)
+
+
 def _files_referencing_key(key):
     """All File records referencing this S3 key.
 
@@ -404,43 +431,51 @@ def _files_referencing_key(key):
     only carry it inside file_url (their content_hash is empty), so fall back
     to a file_url match when the hash lookup finds nothing.
     """
-    fields = ["name", "is_private", "attached_to_doctype", "attached_to_name"]
+    fields = [
+        "name",
+        "is_private",
+        "attached_to_doctype",
+        "attached_to_name",
+        "file_url",
+    ]
     files = frappe.get_all("File", filters={"content_hash": key}, fields=fields)
     if files:
         return files
     logger.debug(
         "[s3_attachment] no content_hash match for key %s; trying file_url", key
     )
-    seen = set()
+    seen, matched = set(), []
     for variant in _key_url_variants(key):
         for f in frappe.get_all(
             "File",
-            filters={"file_url": ("like", "%{}%".format(variant))},
+            filters={"file_url": ("like", "%{}%".format(_escape_like(variant)))},
             fields=fields,
         ):
-            if f.name not in seen:
+            if f.name not in seen and _file_url_references_key(f.file_url, key):
                 seen.add(f.name)
-                files.append(f)
-    return files
+                matched.append(f)
+    return matched
 
 
 def _other_files_reference_key(key, exclude_name):
     """True if any other File record still references this S3 key.
 
-    LIKE wildcards inside the key can only over-match, which errs on the safe
-    side: the S3 object is kept, never deleted while possibly referenced.
+    Used before deleting an S3 object: keep it while any copy (by content_hash
+    or by exact key in file_url) still points at it.
     """
     if frappe.db.count("File", {"content_hash": key, "name": ("!=", exclude_name)}):
         return True
     for variant in _key_url_variants(key):
-        if frappe.db.count(
+        for f in frappe.get_all(
             "File",
-            {
-                "file_url": ("like", "%{}%".format(variant)),
+            filters={
+                "file_url": ("like", "%{}%".format(_escape_like(variant))),
                 "name": ("!=", exclude_name),
             },
+            fields=["file_url"],
         ):
-            return True
+            if _file_url_references_key(f.file_url, key):
+                return True
     return False
 
 
