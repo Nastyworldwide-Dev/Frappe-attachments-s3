@@ -483,21 +483,31 @@ def _check_file_access(key):
     """
     Ensure the current user may download the S3 object for ``key``.
 
-    Access follows the document the file is attached to, mirroring Frappe's
-    native private-file check. Allows access if any File referencing this key is
-    accessible (amended documents legitimately share one S3 object).
+    By default any authenticated user may download a file the site knows about
+    (the app's historical behaviour; sites often grant logins without doctype
+    role permissions). With "Restrict Downloads by Document Permission"
+    enabled, access mirrors Frappe's native private-file check
+    (``File.is_downloadable``: owner, shares, or read on the attached
+    document). Allows access if any File referencing this key is accessible
+    (amended documents legitimately share one S3 object).
     """
+    if frappe.session.user == "Guest":
+        logger.warning("[s3_attachment] generate_file: guest denied for key %s", key)
+        raise frappe.PermissionError(
+            frappe._("You are not permitted to access this file")
+        )
     files = _files_referencing_key(key)
     if not files:
         logger.warning("[s3_attachment] generate_file: no File owns key %s", key)
         raise frappe.PermissionError(frappe._("File not found"))
+    if not frappe.db.get_single_value(
+        "S3 File Attachment", "strict_download_permissions"
+    ):
+        return
     for f in files:
         if not f.is_private:
             return
-        if f.attached_to_doctype and f.attached_to_name:
-            if frappe.has_permission(f.attached_to_doctype, doc=f.attached_to_name):
-                return
-        elif frappe.has_permission("File", doc=f.name):
+        if frappe.get_doc("File", f.name).is_downloadable():
             return
     logger.warning("[s3_attachment] generate_file: access denied for key %s", key)
     raise frappe.PermissionError(frappe._("You are not permitted to access this file"))

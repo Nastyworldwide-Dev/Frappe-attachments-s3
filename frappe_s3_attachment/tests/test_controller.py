@@ -638,7 +638,9 @@ class TestGenerateFileAuthKeyInFileUrl(unittest.TestCase):
         mock_frappe.local._s3_operations = None
         mock_frappe.PermissionError = type("PermissionError", (Exception,), {})
         mock_frappe._ = lambda s: s
-        mock_frappe.has_permission.return_value = has_perm
+        mock_frappe.session.user = "user@example.com"
+        mock_frappe.db.get_single_value.return_value = 1  # strict mode
+        mock_frappe.get_doc.return_value.is_downloadable.return_value = has_perm
         signed = {"n": 0}
 
         def _get_all(doctype, filters=None, fields=None):
@@ -711,8 +713,10 @@ class TestGenerateFileAuth(unittest.TestCase):
         mock_frappe.local._s3_operations = None
         mock_frappe.PermissionError = type("PermissionError", (Exception,), {})
         mock_frappe._ = lambda s: s
+        mock_frappe.session.user = "user@example.com"
+        mock_frappe.db.get_single_value.return_value = 1  # strict mode
         mock_frappe.get_all.return_value = [_types.SimpleNamespace(**f) for f in files]
-        mock_frappe.has_permission.return_value = has_perm
+        mock_frappe.get_doc.return_value.is_downloadable.return_value = has_perm
 
         with (
             patch("frappe_s3_attachment.controller.frappe", mock_frappe),
@@ -768,6 +772,89 @@ class TestGenerateFileAuth(unittest.TestCase):
             "attached_to_name": None,
         }
         denied, signed = self._run(files=[f], has_perm=False)
+        self.assertFalse(denied)
+        self.assertEqual(signed, 1)
+
+
+class TestDownloadPermissionModes(unittest.TestCase):
+    """Default mode allows any logged-in user; strict mode gates on native File permission.
+
+    The strict per-document gate (introduced in 0.1.8) broke sites whose users
+    hold logins but not doctype role permissions — every attachment 403'd. The
+    default must therefore stay backward compatible (authenticated users only),
+    with strict document-permission checks as an opt-in that mirrors Frappe's
+    native File.is_downloadable (owner, shares, attached-document read).
+    """
+
+    def _run(
+        self,
+        *,
+        strict,
+        is_downloadable=False,
+        has_perm=False,
+        user="user@example.com",
+        files=None,
+    ):
+        import types as _types
+
+        mock_frappe = MagicMock()
+        mock_frappe.local._s3_operations = None
+        mock_frappe.PermissionError = type("PermissionError", (Exception,), {})
+        mock_frappe._ = lambda s: s
+        mock_frappe.session.user = user
+        mock_frappe.db.get_single_value.return_value = strict
+        mock_frappe.has_permission.return_value = has_perm
+        mock_frappe.get_doc.return_value.is_downloadable.return_value = is_downloadable
+        if files is None:
+            files = [
+                {
+                    "name": "F1",
+                    "is_private": 1,
+                    "attached_to_doctype": "Purchase Order",
+                    "attached_to_name": "PO-1",
+                }
+            ]
+        mock_frappe.get_all.return_value = [_types.SimpleNamespace(**f) for f in files]
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch("frappe_s3_attachment.controller.S3Operations") as mock_ops,
+        ):
+            mock_ops.return_value.get_url.return_value = "https://signed"
+            from frappe_s3_attachment.controller import generate_file
+
+            try:
+                generate_file(key="2026/x_f.pdf", file_name="f.pdf")
+                denied = False
+            except mock_frappe.PermissionError:
+                denied = True
+
+        return denied, mock_ops.return_value.get_url.call_count
+
+    def test_default_mode_allows_any_logged_in_user(self):
+        """Regression: users without document permission must still download."""
+        denied, signed = self._run(strict=0, is_downloadable=False, has_perm=False)
+        self.assertFalse(denied)
+        self.assertEqual(signed, 1)
+
+    def test_default_mode_still_denies_guest(self):
+        denied, signed = self._run(strict=0, user="Guest")
+        self.assertTrue(denied)
+        self.assertEqual(signed, 0)
+
+    def test_default_mode_unknown_key_denied(self):
+        denied, signed = self._run(strict=0, files=[])
+        self.assertTrue(denied)
+        self.assertEqual(signed, 0)
+
+    def test_strict_mode_denies_without_native_permission(self):
+        denied, signed = self._run(strict=1, is_downloadable=False)
+        self.assertTrue(denied)
+        self.assertEqual(signed, 0)
+
+    def test_strict_mode_allows_via_native_file_permission(self):
+        """Owner/shared/attached-doc access comes from File.is_downloadable."""
+        denied, signed = self._run(strict=1, is_downloadable=True)
         self.assertFalse(denied)
         self.assertEqual(signed, 1)
 
