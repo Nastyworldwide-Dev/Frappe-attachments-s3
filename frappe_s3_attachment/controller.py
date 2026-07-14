@@ -491,6 +491,8 @@ def _check_file_access(key):
     document). Allows access if any File referencing this key is accessible
     (amended documents legitimately share one S3 object).
     """
+    # Defense-in-depth: @frappe.whitelist() without allow_guest already blocks
+    # Guest at the handler; this guards the default-allow path if that changes.
     if frappe.session.user == "Guest":
         logger.warning("[s3_attachment] generate_file: guest denied for key %s", key)
         raise frappe.PermissionError(
