@@ -1170,5 +1170,89 @@ class TestIsS3File(unittest.TestCase):
         self.assertFalse(self._is_s3("/private/files/foo.pdf", "localhash"))
 
 
+class TestGetFullPathS3(unittest.TestCase):
+    """Verify CustomFile.get_full_path does not throw for S3-backed files (amend fix).
+
+    Amending a document copies its private attachment into a new File whose
+    file_url is /api/method/...generate_file?key=... . Frappe core's
+    get_full_path() tries to resolve that as a local disk path and throws
+    "Cannot access file path" during the copy's save. The override must return
+    an absolute URL instead, mirroring how core treats remote http(s) files.
+    """
+
+    def test_private_generate_file_url_returns_absolute_url(self):
+        """The reported crash case: private amended copy must not throw.
+
+        Exercises the real override on the S3 branch (which returns before
+        super(), so a lightweight namespace stands in for a File instance).
+        """
+        import types as _types
+        from unittest.mock import patch
+
+        from frappe_s3_attachment.overrides.file import CustomFile
+
+        url = (
+            "/api/method/frappe_s3_attachment.controller.generate_file"
+            "?key=ERPNext/2026/07/14/Purchase Invoice/86TXIM64_NFS.pdf"
+            "&file_name=NFS.pdf"
+        )
+        obj = _types.SimpleNamespace(file_url=url, content_hash="")
+        obj.is_s3_file = lambda: CustomFile.is_s3_file(obj)
+        with patch("frappe_s3_attachment.overrides.file.frappe") as mock_frappe:
+            mock_frappe.utils.get_url.side_effect = lambda u: "https://site.example" + u
+            result = CustomFile.get_full_path(obj)
+
+        self.assertTrue(result.startswith("https://site.example"))
+        self.assertIn("/api/method/", result)
+
+    def test_local_file_delegates_to_super(self):
+        """A normal local file is not an S3 file, so the override delegates to
+        core get_full_path (the branch decision is is_s3_file())."""
+        import types as _types
+
+        from frappe_s3_attachment.overrides.file import CustomFile
+
+        obj = _types.SimpleNamespace(
+            file_url="/private/files/x.pdf", content_hash="localhash"
+        )
+        self.assertFalse(CustomFile.is_s3_file(obj))
+
+
+class TestS3KeyFromFileUrl(unittest.TestCase):
+    """Verify CustomFile._s3_key falls back to the ?key= in file_url (amend fix).
+
+    Amended-document copies carry the S3 key only inside file_url's query
+    string (their content_hash is empty), so _get_content_from_s3 must derive
+    the key from file_url rather than throwing "S3 key not found".
+    """
+
+    def _key(self, *, file_url, content_hash):
+        import types as _types
+
+        from frappe_s3_attachment.overrides.file import CustomFile
+
+        obj = _types.SimpleNamespace(file_url=file_url, content_hash=content_hash)
+        return CustomFile._s3_key(obj)
+
+    def test_prefers_content_hash_when_present(self):
+        self.assertEqual(
+            self._key(file_url="/api/method/x?key=other", content_hash="THEKEY"),
+            "THEKEY",
+        )
+
+    def test_parses_key_from_file_url_when_hash_empty(self):
+        from urllib.parse import quote
+
+        key = "ERPNext/2026/07/14/Purchase Invoice/86TXIM64_NFS.pdf"
+        url = (
+            "/api/method/frappe_s3_attachment.controller.generate_file"
+            "?key={}&file_name=NFS.pdf".format(quote(key))
+        )
+        self.assertEqual(self._key(file_url=url, content_hash=""), key)
+
+    def test_returns_none_when_no_key_anywhere(self):
+        self.assertIsNone(self._key(file_url="/private/files/x.pdf", content_hash=""))
+
+
 if __name__ == "__main__":
     unittest.main()
