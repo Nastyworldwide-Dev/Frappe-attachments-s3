@@ -2,6 +2,7 @@
 
 import unittest
 from unittest.mock import patch, MagicMock
+from urllib.parse import quote
 
 
 class TestFileUploadToS3SkipsExisting(unittest.TestCase):
@@ -857,6 +858,110 @@ class TestDownloadPermissionModes(unittest.TestCase):
         denied, signed = self._run(strict=1, is_downloadable=True)
         self.assertFalse(denied)
         self.assertEqual(signed, 1)
+
+
+class TestDoubleEncodedKeyResolution(unittest.TestCase):
+    """Desk sidebar encodeURI()s file_url, double-encoding stored %-escapes.
+
+    Rows written since the URL-encoding fix store the key quoted in file_url
+    (e.g. Purchase%20Order); v15's attachments sidebar encodeURI()s the href so
+    the server decodes the key only half-way (key arrives as
+    'ERP/.../Purchase%20Order/...'). generate_file must fall back to the
+    once-unquoted key — and sign S3 with the key that actually matched.
+    """
+
+    RAW_KEY = "ERP/2026/05/15/Purchase Order/EBOVX8YR_x.xlsx"
+    HALF_DECODED = "ERP/2026/05/15/Purchase%20Order/EBOVX8YR_x.xlsx"
+
+    def _run(self, *, request_key, rows_by_hash, file_name="x.xlsx"):
+        import types as _types
+
+        mock_frappe = MagicMock()
+        mock_frappe.local._s3_operations = None
+        mock_frappe.PermissionError = type("PermissionError", (Exception,), {})
+        mock_frappe._ = lambda s: s
+        mock_frappe.session.user = "user@example.com"
+        mock_frappe.db.get_single_value.return_value = 0  # default mode
+
+        def _get_all(doctype, filters=None, fields=None):
+            content_hash = (filters or {}).get("content_hash")
+            if content_hash is not None:
+                return [
+                    _types.SimpleNamespace(**r)
+                    for r in rows_by_hash
+                    if r["content_hash"] == content_hash
+                ]
+            return []  # no file_url LIKE matches in these scenarios
+
+        mock_frappe.get_all.side_effect = _get_all
+        signed = []
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch("frappe_s3_attachment.controller.S3Operations") as mock_ops,
+        ):
+            mock_ops.return_value.get_url.side_effect = lambda key, fname=None: (
+                signed.append((key, fname)) or "https://signed"
+            )
+            from frappe_s3_attachment.controller import generate_file
+
+            try:
+                generate_file(key=request_key, file_name=file_name)
+                denied = False
+            except mock_frappe.PermissionError:
+                denied = True
+
+        return denied, signed
+
+    def _row(self, content_hash, **over):
+        row = {
+            "name": "F-" + content_hash[-8:],
+            "is_private": 1,
+            "attached_to_doctype": "Purchase Order",
+            "attached_to_name": "PO-1",
+            "file_url": "/api/method/frappe_s3_attachment.controller.generate_file"
+            "?key=" + quote(content_hash) + "&file_name=x.xlsx",
+            "content_hash": content_hash,
+        }
+        row.update(over)
+        return row
+
+    def test_half_decoded_key_resolves_and_signs_raw_key(self):
+        """Regression: sidebar-clicked keys arrive %-encoded and must still work."""
+        denied, signed = self._run(
+            request_key=self.HALF_DECODED,
+            rows_by_hash=[self._row(self.RAW_KEY)],
+            file_name="my%20file.xlsx",
+        )
+        self.assertFalse(denied)
+        # S3 must be signed with the key that matched, not the mangled input,
+        # and the file_name must be un-mangled the same way.
+        self.assertEqual(signed, [(self.RAW_KEY, "my file.xlsx")])
+
+    def test_raw_key_still_resolves_directly(self):
+        denied, signed = self._run(
+            request_key=self.RAW_KEY, rows_by_hash=[self._row(self.RAW_KEY)]
+        )
+        self.assertFalse(denied)
+        self.assertEqual(signed, [(self.RAW_KEY, "x.xlsx")])
+
+    def test_as_received_key_wins_over_unquoted_sibling(self):
+        """A literal %-containing key (custom hook) must not be hijacked by its
+        decoded sibling: the as-received match is tried first."""
+        literal = self._row(self.HALF_DECODED)  # hook-generated literal '%20'
+        decoded = self._row(self.RAW_KEY)
+        denied, signed = self._run(
+            request_key=self.HALF_DECODED, rows_by_hash=[literal, decoded]
+        )
+        self.assertFalse(denied)
+        self.assertEqual(signed[0][0], self.HALF_DECODED)
+
+    def test_unknown_key_still_denied_after_fallback(self):
+        denied, signed = self._run(
+            request_key="ERP/2026/01/01/Item/NOPE_x.pdf", rows_by_hash=[]
+        )
+        self.assertTrue(denied)
+        self.assertEqual(signed, [])
 
 
 class TestUploadErrorHandling(unittest.TestCase):

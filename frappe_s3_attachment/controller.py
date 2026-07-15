@@ -7,7 +7,7 @@ import random
 import re
 import string
 
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import boto3
 
@@ -383,7 +383,12 @@ def generate_file(key=None, file_name=None):
     # Enforce the same per-download permission Frappe applies to native private
     # files. Without this, any logged-in user could download any S3 object by
     # passing its key here.
-    _check_file_access(key)
+    resolved_key = _check_file_access(key)
+    if resolved_key != key:
+        # The whole URL arrived double-encoded (desk sidebar encodeURI over a
+        # stored %-escaped file_url); un-mangle file_name the same way.
+        file_name = unquote(file_name) if file_name else file_name
+        key = resolved_key
     logger.debug("[s3_attachment] generate_file signing key %s", key)
     s3_upload = get_s3_client()
     signed_url = s3_upload.get_url(key, file_name)
@@ -479,9 +484,35 @@ def _other_files_reference_key(key, exclude_name):
     return False
 
 
+def _resolve_files_for_key(key):
+    """Return ``(resolved_key, files)`` for a request key.
+
+    The desk sidebar encodeURI()s file_url before rendering the link; for
+    rows whose stored file_url is %-escaped this double-encodes it, so the
+    server-side decode leaves a once-encoded key (e.g. ``Purchase%20Order``).
+    Try the key as received first (a custom s3_key_generator hook could emit
+    literal ``%``), then fall back to the once-unquoted form.
+    """
+    files = _files_referencing_key(key)
+    if files:
+        return key, files
+    if "%" in key:
+        decoded = unquote(key)
+        if decoded != key:
+            files = _files_referencing_key(decoded)
+            if files:
+                logger.info(
+                    "[s3_attachment] generate_file: resolved double-encoded key %s",
+                    key,
+                )
+                return decoded, files
+    return key, []
+
+
 def _check_file_access(key):
     """
-    Ensure the current user may download the S3 object for ``key``.
+    Ensure the current user may download the S3 object for ``key``; return
+    the key that actually matched (see ``_resolve_files_for_key``).
 
     By default any authenticated user may download a file the site knows about
     (the app's historical behaviour; sites often grant logins without doctype
@@ -498,19 +529,19 @@ def _check_file_access(key):
         raise frappe.PermissionError(
             frappe._("You are not permitted to access this file")
         )
-    files = _files_referencing_key(key)
+    key, files = _resolve_files_for_key(key)
     if not files:
         logger.warning("[s3_attachment] generate_file: no File owns key %s", key)
         raise frappe.PermissionError(frappe._("File not found"))
     if not frappe.db.get_single_value(
         "S3 File Attachment", "strict_download_permissions"
     ):
-        return
+        return key
     for f in files:
         if not f.is_private:
-            return
+            return key
         if frappe.get_doc("File", f.name).is_downloadable():
-            return
+            return key
     logger.warning("[s3_attachment] generate_file: access denied for key %s", key)
     raise frappe.PermissionError(frappe._("You are not permitted to access this file"))
 
