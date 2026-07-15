@@ -7,7 +7,7 @@ import random
 import re
 import string
 
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import boto3
 
@@ -372,6 +372,31 @@ def file_upload_to_s3(doc, method):
         # transaction so they roll back together if the save later fails.
 
 
+def _resolve_download_key(key):
+    """Return the stored S3 key for a download request, undoing double-encoding.
+
+    The stored file_url already holds the key URL-encoded (``quote``). When
+    Frappe renders that link it encodes it a second time, so a key containing a
+    space ("Purchase Order" -> "Purchase%20Order") reaches this endpoint still
+    percent-encoded after the request layer's single decode. That form matches
+    no File row (content_hash keeps the literal space), so fall back to the
+    unquoted key when the raw key references nothing. App-generated keys never
+    contain a literal '%' (strip_special_chars removes it), so unquoting is safe
+    and idempotent for correctly-encoded keys.
+    """
+    if _files_referencing_key(key):
+        return key
+    decoded = unquote(key)
+    if decoded != key and _files_referencing_key(decoded):
+        logger.debug(
+            "[s3_attachment] generate_file: resolved double-encoded key %s -> %s",
+            key,
+            decoded,
+        )
+        return decoded
+    return key
+
+
 @frappe.whitelist()
 def generate_file(key=None, file_name=None):
     """
@@ -380,6 +405,11 @@ def generate_file(key=None, file_name=None):
     if not key:
         frappe.local.response["body"] = "Key not found."
         return
+    key = _resolve_download_key(key)
+    # The file name can arrive double-encoded too; unquote it so the download is
+    # named "NSTY FOOD & SUPPLY.pdf", not "NSTY%20FOOD%20%26%20SUPPLY.pdf".
+    if file_name:
+        file_name = unquote(file_name)
     # Enforce the same per-download permission Frappe applies to native private
     # files. Without this, any logged-in user could download any S3 object by
     # passing its key here.

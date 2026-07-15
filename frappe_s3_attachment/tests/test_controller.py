@@ -701,6 +701,74 @@ class TestGenerateFileAuthKeyInFileUrl(unittest.TestCase):
         self.assertEqual(signed, 0)
 
 
+class TestGenerateFileDoubleEncodedKey(unittest.TestCase):
+    """Verify generate_file resolves a double-encoded key back to the stored key.
+
+    Frappe re-encodes the already-quoted stored file_url when rendering the
+    attachment link, so a key with a space (e.g. "Purchase Order") is stored
+    quoted as "Purchase%20Order" and rendered as "Purchase%2520Order". The
+    request layer decodes that once, so generate_file receives
+    "Purchase%20Order" — which matches no File row (content_hash holds the
+    literal space) and used to fail with PermissionError "Not Permitted".
+    """
+
+    SPACE_KEY = "2026/05/18/Purchase Order/1TLG3BY1_x.pdf"
+    ENCODED_KEY = "2026/05/18/Purchase%20Order/1TLG3BY1_x.pdf"
+
+    def _run(self, *, request_key, has_perm=True):
+        import types as _types
+
+        mock_frappe = MagicMock()
+        mock_frappe.local._s3_operations = None
+        mock_frappe.PermissionError = type("PermissionError", (Exception,), {})
+        mock_frappe._ = lambda s: s
+        mock_frappe.has_permission.return_value = has_perm
+        stored = {
+            "name": "F1",
+            "is_private": 1,
+            "attached_to_doctype": "Purchase Order",
+            "attached_to_name": "PO-1",
+            "file_url": _private_url(self.SPACE_KEY),
+        }
+
+        def _get_all(doctype, filters=None, fields=None):
+            # Only a content_hash lookup for the real (space) key matches; the
+            # once-decoded "%20" key and any file_url LIKE find nothing.
+            if (filters or {}).get("content_hash") == self.SPACE_KEY:
+                return [_types.SimpleNamespace(**stored)]
+            return []
+
+        mock_frappe.get_all.side_effect = _get_all
+
+        with (
+            patch("frappe_s3_attachment.controller.frappe", mock_frappe),
+            patch("frappe_s3_attachment.controller.S3Operations") as mock_ops,
+        ):
+            mock_ops.return_value.get_url.return_value = "https://signed"
+            from frappe_s3_attachment.controller import generate_file
+
+            try:
+                generate_file(key=request_key, file_name="x.pdf")
+                denied = False
+            except mock_frappe.PermissionError:
+                denied = True
+
+            return denied, mock_ops.return_value.get_url
+
+    def test_double_encoded_key_is_resolved_and_signed(self):
+        denied, get_url = self._run(request_key=self.ENCODED_KEY)
+        self.assertFalse(denied)
+        self.assertEqual(get_url.call_count, 1)
+        # S3 must be signed with the real (space) key, not the "%20" form.
+        self.assertEqual(get_url.call_args.args[0], self.SPACE_KEY)
+
+    def test_unknown_key_still_denied_after_fallback(self):
+        """The unquote fallback must not loosen the deny path (SEC-01)."""
+        denied, get_url = self._run(request_key="2026/05/18/Nope%20Dir/xxx.pdf")
+        self.assertTrue(denied)
+        self.assertEqual(get_url.call_count, 0)
+
+
 class TestGenerateFileAuth(unittest.TestCase):
     """Verify generate_file enforces document permission before signing (H2)."""
 
