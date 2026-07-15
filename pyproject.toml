@@ -14,3 +14,9 @@ build-backend = "flit_core.buildapi"
 
 [tool.flit.module]
 name = "frappe_s3_attachment"
+
+# Frappe compatibility range read by bench's app dependency resolver.
+# Without it, newer Frappe rejects the app on branch switch / install with
+# "Invalid version format ... Please use NPM-style semver ranges".
+[tool.bench.frappe-dependencies]
+frappe = ">=15.0.0 <16.0.0"
