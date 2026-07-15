@@ -945,6 +945,18 @@ class TestDoubleEncodedKeyResolution(unittest.TestCase):
         self.assertFalse(denied)
         self.assertEqual(signed, [(self.RAW_KEY, "x.xlsx")])
 
+    def test_file_name_unquoted_even_when_key_resolves_directly(self):
+        """A space-free key (e.g. Item folder) resolves on the first try, but
+        the sidebar still double-encodes file_name independently."""
+        key = "ERP/2026/06/22/Item/V4722XBH_draft_jacket.jpg"
+        denied, signed = self._run(
+            request_key=key,
+            rows_by_hash=[self._row(key)],
+            file_name="draft%20jacket.jpg",
+        )
+        self.assertFalse(denied)
+        self.assertEqual(signed, [(key, "draft jacket.jpg")])
+
     def test_as_received_key_wins_over_unquoted_sibling(self):
         """A literal %-containing key (custom hook) must not be hijacked by its
         decoded sibling: the as-received match is tried first."""

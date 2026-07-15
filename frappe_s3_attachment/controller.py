@@ -383,12 +383,12 @@ def generate_file(key=None, file_name=None):
     # Enforce the same per-download permission Frappe applies to native private
     # files. Without this, any logged-in user could download any S3 object by
     # passing its key here.
-    resolved_key = _check_file_access(key)
-    if resolved_key != key:
-        # The whole URL arrived double-encoded (desk sidebar encodeURI over a
-        # stored %-escaped file_url); un-mangle file_name the same way.
-        file_name = unquote(file_name) if file_name else file_name
-        key = resolved_key
+    key = _check_file_access(key)
+    if file_name and "%" in file_name:
+        # The desk sidebar encodeURI()s the whole href, double-encoding the
+        # stored %-escaped file_name even when the key needed no correction
+        # (space-free keys resolve directly; file names are stored quoted).
+        file_name = unquote(file_name)
     logger.debug("[s3_attachment] generate_file signing key %s", key)
     s3_upload = get_s3_client()
     signed_url = s3_upload.get_url(key, file_name)
