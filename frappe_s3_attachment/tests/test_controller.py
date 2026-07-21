@@ -55,6 +55,58 @@ class TestFileUploadToS3SkipsExisting(unittest.TestCase):
         self.assertFalse(self._run_hook(url))
 
 
+class TestMakeFileUrl(unittest.TestCase):
+    """Verify _make_file_url only emits a direct S3 URL for genuinely public objects.
+
+    A public File is uploaded WITHOUT a public-read ACL unless s3_use_acl is set
+    (and AWS Block Public Access disables ACLs by default). A direct S3 URL to
+    such an object returns the ``AccessDenied`` XML in the browser — the reported
+    webform-upload failure. So public files must be served through the presigned
+    generate_file endpoint unless s3_use_acl is enabled.
+    """
+
+    ENDPOINT = "https://s3.us-east-1.amazonaws.com"
+    KEY = "folder/2026/07/21/Web Form/ABC_report.pdf"
+
+    def _url(self, *, is_private, s3_use_acl):
+        mock_frappe = MagicMock()
+        mock_frappe.local.conf.get.side_effect = lambda k: (
+            s3_use_acl if k == "s3_use_acl" else None
+        )
+
+        s3_upload = MagicMock()
+        s3_upload.S3_CLIENT.meta.endpoint_url = self.ENDPOINT
+        s3_upload.BUCKET = "test-bucket"
+
+        with patch("frappe_s3_attachment.controller.frappe", mock_frappe):
+            from frappe_s3_attachment.controller import _make_file_url
+
+            return _make_file_url(s3_upload, self.KEY, "report.pdf", is_private)
+
+    def test_public_file_without_acl_uses_generate_file_endpoint(self):
+        """The reported bug: a public webform file with no ACL must be served
+        through the presigned endpoint, not a direct (AccessDenied) S3 URL."""
+        from urllib.parse import parse_qs
+
+        url = self._url(is_private=False, s3_use_acl=None)
+        self.assertTrue(url.startswith("/api/method/"))
+        self.assertIn("generate_file", url)
+        self.assertEqual(parse_qs(url.split("?", 1)[1])["key"][0], self.KEY)
+
+    def test_public_file_with_acl_uses_direct_url(self):
+        """With s3_use_acl the object really is public-read, so a direct,
+        CDN-friendly S3 URL is correct."""
+        url = self._url(is_private=False, s3_use_acl=True)
+        self.assertTrue(url.startswith(self.ENDPOINT + "/test-bucket/"))
+        self.assertNotIn("/api/method/", url)
+
+    def test_private_file_always_uses_generate_file_endpoint(self):
+        """Private files are served through the presigned endpoint regardless."""
+        url = self._url(is_private=True, s3_use_acl=True)
+        self.assertTrue(url.startswith("/api/method/"))
+        self.assertIn("generate_file", url)
+
+
 class TestS3UploadACL(unittest.TestCase):
     """Verify ACL parameter behavior in upload_files_to_s3_with_key."""
 
