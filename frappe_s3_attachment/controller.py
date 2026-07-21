@@ -242,11 +242,22 @@ def _header_safe_filename(file_name):
 def _make_file_url(s3_upload, key, file_name, is_private):
     """Build the stored file_url for an uploaded object.
 
+    A direct S3 URL (``{endpoint}/{bucket}/{key}``) is only reachable when the
+    object is genuinely public-read. This app only applies a ``public-read`` ACL
+    when ``s3_use_acl`` is set (see upload_files_to_s3_with_key), and modern AWS
+    buckets disable ACLs / Block Public Access by default — so a direct URL to a
+    public File uploaded without that flag returns the ``AccessDenied`` XML in
+    the browser (the reported webform-upload failure). Serve such files through
+    the presigned generate_file endpoint instead, exactly like private files
+    (generate_file signs public files without a permission check). Only emit a
+    direct URL when the object really is public.
+
     Values are URL-encoded: keys contain spaces (doctype names) and file
     names may contain '&' or '#', which would truncate the query string.
     """
     logger.debug("[s3_attachment] building file_url for key %s", key)
-    if is_private:
+    object_is_public = not is_private and frappe.local.conf.get("s3_use_acl")
+    if not object_is_public:
         return "/api/method/{0}?key={1}&file_name={2}".format(
             "frappe_s3_attachment.controller.generate_file",
             quote(key),
