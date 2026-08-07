@@ -9,7 +9,7 @@ import string
 
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-import boto3
+from frappe_s3_attachment.boto3_compat import boto3
 
 from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
