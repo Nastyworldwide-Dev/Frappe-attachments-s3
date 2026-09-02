@@ -14,3 +14,8 @@ build-backend = "flit_core.buildapi"
 
 [tool.flit.module]
 name = "frappe_s3_attachment"
+
+# Read by Frappe Cloud (press) and `bench get-app` to pick a compatible bench.
+# NPM-style semver range; must be bounded on both ends.
+[tool.bench.frappe-dependencies]
+frappe = ">=15.0.0,<17.0.0"
